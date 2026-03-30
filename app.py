@@ -1,18 +1,22 @@
 """
-NaijaPlate AI — WhatsApp Bot
-────────────────────────────
-Twilio WhatsApp Sandbox + Flask webhook
-Deploy on Railway or Render (free tier)
-
-Run locally:  python whatsapp_bot.py
+NaijaPlate AI — WhatsApp Bot v2
+────────────────────────────────
+Improvements:
+- No prices or price tags
+- Reduced emojis
+- WhatsApp interactive list menus
+- Personalised greeting with name + time-of-day
+- Conversational and interactive
+- No sandbox join code (Meta Business API note included)
+- About section credits James as developer
 """
 
 import os
 import json
 import random
 import re
-from datetime import datetime
-from flask import Flask, request
+from datetime import datetime, timezone, timedelta
+from flask import Flask, request, Response
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.rest import Client
 
@@ -22,100 +26,134 @@ from twilio.rest import Client
 
 app = Flask(__name__)
 
-# Twilio credentials — set as environment variables (never hardcode!)
 TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN  = os.environ.get("TWILIO_AUTH_TOKEN",  "")
 
+# Nigeria timezone (WAT = UTC+1)
+WAT = timezone(timedelta(hours=1))
+
 # ─────────────────────────────────────────────────────────────────────────────
-# SESSION STORE  (in-memory; resets on server restart)
-# For production, swap this for Redis or a simple SQLite file
+# SESSION STORE
 # ─────────────────────────────────────────────────────────────────────────────
 
-sessions = {}   # { "whatsapp:+2348012345678": { ...user state... } }
+sessions = {}  # { "whatsapp:+234...": { step, profile, last_plan, name, ... } }
 
 def get_session(phone: str) -> dict:
     if phone not in sessions:
         sessions[phone] = {
-            "step":       "welcome",   # conversation FSM state
-            "profile":    {},
-            "last_plan":  None,
-            "onboarding": {},          # temp storage during multi-step onboarding
+            "step":      "new",
+            "profile":   {},
+            "last_plan": None,
+            "name":      None,
+            "awaiting":  None,   # what we're waiting for from user
+            "history":   [],     # last few exchanges for context
         }
     return sessions[phone]
 
 def save_session(phone: str, session: dict):
     sessions[phone] = session
 
+def add_history(session: dict, role: str, text: str):
+    session["history"].append({"role": role, "text": text})
+    if len(session["history"]) > 10:
+        session["history"] = session["history"][-10:]
+
 # ─────────────────────────────────────────────────────────────────────────────
-# NIGERIAN MEAL DATABASE  (subset of full 64-dish DB — 30 dishes for bot speed)
+# TIME-AWARE GREETING
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_greeting() -> str:
+    hour = datetime.now(WAT).hour
+    if hour < 12:
+        return "Good morning"
+    elif hour < 17:
+        return "Good afternoon"
+    else:
+        return "Good evening"
+
+def get_time_tip() -> str:
+    hour = datetime.now(WAT).hour
+    if hour < 10:
+        return "Starting your day right with a good breakfast sets the tone. What would you like to eat today?"
+    elif hour < 13:
+        return "It's almost lunch time! Want me to suggest something nutritious?"
+    elif hour < 17:
+        return "Afternoon energy dip? A light snack or early dinner plan might help."
+    else:
+        return "Evening is a great time to plan tomorrow's meals. Want a full day plan?"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MEAL DATABASE
 # ─────────────────────────────────────────────────────────────────────────────
 
 MEAL_DB = [
     # BREAKFAST
-    {"id":1,  "name":"Akara & Ogi (Pap)",              "type":"Breakfast","calories":380,"protein":18,"carbs":55,"fat":10,"cost":350, "allergens":["legumes"],         "tags":["High-Protein","Diabetic-Friendly","Budget-Friendly"]},
-    {"id":2,  "name":"Moi Moi & Custard",              "type":"Breakfast","calories":420,"protein":22,"carbs":60,"fat":11,"cost":500, "allergens":["eggs","milk"],      "tags":["High-Protein","Budget-Friendly"]},
-    {"id":3,  "name":"Yam & Egg Sauce",                "type":"Breakfast","calories":510,"protein":20,"carbs":70,"fat":18,"cost":600, "allergens":["eggs"],             "tags":["High-Protein","Energy-Boost"]},
-    {"id":4,  "name":"Boli & Groundnut",               "type":"Breakfast","calories":440,"protein":10,"carbs":72,"fat":14,"cost":300, "allergens":["groundnut"],        "tags":["Budget-Friendly","Vegan"]},
-    {"id":5,  "name":"Oatmeal & Tiger Nuts Milk",      "type":"Breakfast","calories":340,"protein":9, "carbs":58,"fat":8, "cost":450, "allergens":[],                   "tags":["Diabetic-Friendly","Weight-Loss","Hypertension-Friendly"]},
-    {"id":6,  "name":"Agege Bread & Ewa Agoyin",       "type":"Breakfast","calories":580,"protein":20,"carbs":90,"fat":14,"cost":400, "allergens":["gluten","legumes"], "tags":["Budget-Friendly","High-Carb"]},
-    {"id":7,  "name":"Sweet Potato & Egg Omelette",    "type":"Breakfast","calories":380,"protein":19,"carbs":45,"fat":14,"cost":550, "allergens":["eggs"],             "tags":["Diabetic-Friendly","Weight-Loss"]},
-    {"id":8,  "name":"Kunu & Masa",                    "type":"Breakfast","calories":310,"protein":7, "carbs":58,"fat":5, "cost":280, "allergens":["gluten"],           "tags":["Low-Fat","Budget-Friendly","Diabetic-Friendly"]},
-    {"id":9,  "name":"Grilled Fish & Fried Plantain",  "type":"Breakfast","calories":520,"protein":38,"carbs":48,"fat":16,"cost":900, "allergens":["fish"],             "tags":["High-Protein","Muscle-Building","Omega-3"]},
-    {"id":10, "name":"Unripe Plantain Porridge",       "type":"Breakfast","calories":350,"protein":12,"carbs":58,"fat":9, "cost":420, "allergens":["fish"],             "tags":["Diabetic-Friendly","Low-Sugar","Heart-Healthy"]},
+    {"id":1,  "name":"Akara and Ogi",               "type":"Breakfast","calories":380,"protein":18,"carbs":55,"fat":10,"allergens":["legumes"],         "tags":["High-Protein","Diabetic-Friendly","Budget-Friendly"]},
+    {"id":2,  "name":"Moi Moi and Custard",          "type":"Breakfast","calories":420,"protein":22,"carbs":60,"fat":11,"allergens":["eggs","milk"],      "tags":["High-Protein"]},
+    {"id":3,  "name":"Yam and Egg Sauce",            "type":"Breakfast","calories":510,"protein":20,"carbs":70,"fat":18,"allergens":["eggs"],             "tags":["High-Protein","Energy-Boost"]},
+    {"id":4,  "name":"Boli and Groundnut",           "type":"Breakfast","calories":440,"protein":10,"carbs":72,"fat":14,"allergens":["groundnut"],        "tags":["Vegan"]},
+    {"id":5,  "name":"Oatmeal and Tiger Nuts Milk",  "type":"Breakfast","calories":340,"protein":9, "carbs":58,"fat":8, "allergens":[],                   "tags":["Diabetic-Friendly","Weight-Loss","Hypertension-Friendly"]},
+    {"id":6,  "name":"Agege Bread and Ewa Agoyin",   "type":"Breakfast","calories":580,"protein":20,"carbs":90,"fat":14,"allergens":["gluten","legumes"], "tags":["Budget-Friendly"]},
+    {"id":7,  "name":"Sweet Potato and Egg Omelette","type":"Breakfast","calories":380,"protein":19,"carbs":45,"fat":14,"allergens":["eggs"],             "tags":["Diabetic-Friendly","Weight-Loss"]},
+    {"id":8,  "name":"Kunu and Masa",               "type":"Breakfast","calories":310,"protein":7, "carbs":58,"fat":5, "allergens":["gluten"],           "tags":["Low-Fat","Diabetic-Friendly"]},
+    {"id":9,  "name":"Grilled Fish and Plantain",    "type":"Breakfast","calories":520,"protein":38,"carbs":48,"fat":16,"allergens":["fish"],             "tags":["High-Protein","Muscle-Building"]},
+    {"id":10, "name":"Unripe Plantain Porridge",     "type":"Breakfast","calories":350,"protein":12,"carbs":58,"fat":9, "allergens":["fish"],             "tags":["Diabetic-Friendly","Heart-Healthy"]},
     # LUNCH
-    {"id":11, "name":"Jollof Rice & Grilled Chicken",  "type":"Lunch",    "calories":650,"protein":42,"carbs":80,"fat":16,"cost":1200,"allergens":[],                   "tags":["High-Protein","Muscle-Building"]},
-    {"id":12, "name":"Egusi Soup & Pounded Yam",       "type":"Lunch",    "calories":720,"protein":35,"carbs":75,"fat":32,"cost":1500,"allergens":[],                   "tags":["High-Protein","Traditional"]},
-    {"id":13, "name":"Efo Riro & Brown Rice",          "type":"Lunch",    "calories":540,"protein":32,"carbs":55,"fat":20,"cost":1100,"allergens":[],                   "tags":["Diabetic-Friendly","Weight-Loss","Hypertension-Friendly"]},
-    {"id":14, "name":"Beans Porridge & Fried Plantain","type":"Lunch",    "calories":620,"protein":28,"carbs":88,"fat":15,"cost":700, "allergens":["legumes","fish"],   "tags":["High-Protein","Budget-Friendly"]},
-    {"id":15, "name":"Chicken Pepper Soup",            "type":"Lunch",    "calories":310,"protein":38,"carbs":8, "fat":14,"cost":1100,"allergens":[],                   "tags":["Low-Carb","Keto-Friendly","Ulcer-Friendly"]},
-    {"id":16, "name":"Ofada Rice & Ayamase Stew",      "type":"Lunch",    "calories":690,"protein":34,"carbs":80,"fat":26,"cost":1300,"allergens":[],                   "tags":["Antioxidant-Rich","Traditional"]},
-    {"id":17, "name":"Vegetable Yam Porridge (Asaro)", "type":"Lunch",    "calories":480,"protein":18,"carbs":72,"fat":14,"cost":700, "allergens":["fish"],             "tags":["Diabetic-Friendly","Budget-Friendly","Weight-Loss"]},
-    {"id":18, "name":"Suya & Yaji Salad",              "type":"Lunch",    "calories":430,"protein":42,"carbs":20,"fat":22,"cost":900, "allergens":["groundnut"],        "tags":["High-Protein","Low-Carb","Keto-Friendly"]},
-    {"id":19, "name":"Moi Moi & Nigerian Salad",       "type":"Lunch",    "calories":420,"protein":28,"carbs":45,"fat":14,"cost":800, "allergens":["eggs","legumes"],   "tags":["High-Protein","Weight-Loss"]},
-    {"id":20, "name":"Miyan Taushe & Tuwon Masara",    "type":"Lunch",    "calories":620,"protein":28,"carbs":75,"fat":22,"cost":850, "allergens":["groundnut"],        "tags":["High-Fiber","Hypertension-Friendly"]},
+    {"id":11, "name":"Jollof Rice and Grilled Chicken","type":"Lunch","calories":650,"protein":42,"carbs":80,"fat":16,"allergens":[],                   "tags":["High-Protein","Muscle-Building"]},
+    {"id":12, "name":"Egusi Soup and Pounded Yam",   "type":"Lunch",    "calories":720,"protein":35,"carbs":75,"fat":32,"allergens":[],                   "tags":["High-Protein","Traditional"]},
+    {"id":13, "name":"Efo Riro and Brown Rice",      "type":"Lunch",    "calories":540,"protein":32,"carbs":55,"fat":20,"allergens":[],                   "tags":["Diabetic-Friendly","Weight-Loss","Hypertension-Friendly"]},
+    {"id":14, "name":"Beans Porridge and Plantain",  "type":"Lunch",    "calories":620,"protein":28,"carbs":88,"fat":15,"allergens":["legumes","fish"],   "tags":["High-Protein","Budget-Friendly"]},
+    {"id":15, "name":"Chicken Pepper Soup",          "type":"Lunch",    "calories":310,"protein":38,"carbs":8, "fat":14,"allergens":[],                   "tags":["Low-Carb","Keto-Friendly","Ulcer-Friendly"]},
+    {"id":16, "name":"Ofada Rice and Ayamase Stew",  "type":"Lunch",    "calories":690,"protein":34,"carbs":80,"fat":26,"allergens":[],                   "tags":["Traditional"]},
+    {"id":17, "name":"Vegetable Yam Porridge",       "type":"Lunch",    "calories":480,"protein":18,"carbs":72,"fat":14,"allergens":["fish"],             "tags":["Diabetic-Friendly","Budget-Friendly","Weight-Loss"]},
+    {"id":18, "name":"Suya and Fresh Salad",         "type":"Lunch",    "calories":430,"protein":42,"carbs":20,"fat":22,"allergens":["groundnut"],        "tags":["High-Protein","Low-Carb","Keto-Friendly"]},
+    {"id":19, "name":"Moi Moi and Nigerian Salad",   "type":"Lunch",    "calories":420,"protein":28,"carbs":45,"fat":14,"allergens":["eggs","legumes"],   "tags":["High-Protein","Weight-Loss"]},
+    {"id":20, "name":"Miyan Taushe and Tuwon Masara","type":"Lunch",    "calories":620,"protein":28,"carbs":75,"fat":22,"allergens":["groundnut"],        "tags":["High-Fiber","Hypertension-Friendly"]},
     # DINNER
-    {"id":21, "name":"Grilled Chicken & Roasted Veggies","type":"Dinner", "calories":420,"protein":48,"carbs":18,"fat":16,"cost":1400,"allergens":[],                   "tags":["High-Protein","Low-Carb","Weight-Loss","Muscle-Building"]},
-    {"id":22, "name":"Ofe Akwu & Eba",                 "type":"Dinner",   "calories":680,"protein":36,"carbs":60,"fat":34,"cost":1200,"allergens":[],                   "tags":["High-Protein","Traditional"]},
-    {"id":23, "name":"Beef Pepper Soup",               "type":"Dinner",   "calories":320,"protein":40,"carbs":6, "fat":16,"cost":1100,"allergens":[],                   "tags":["Low-Carb","Keto-Friendly","Ulcer-Friendly"]},
-    {"id":24, "name":"Baked Tilapia & Coconut Rice",   "type":"Dinner",   "calories":540,"protein":40,"carbs":60,"fat":16,"cost":1600,"allergens":["fish"],             "tags":["High-Protein","Heart-Healthy","Omega-3"]},
-    {"id":25, "name":"Plantain Frittata",              "type":"Dinner",   "calories":400,"protein":22,"carbs":44,"fat":16,"cost":700, "allergens":["eggs"],             "tags":["High-Protein","Gluten-Free","Weight-Loss"]},
-    {"id":26, "name":"Vegetable Fried Rice (Vegan)",   "type":"Dinner",   "calories":450,"protein":10,"carbs":82,"fat":9, "cost":700, "allergens":[],                   "tags":["Vegan","Low-Fat","Heart-Healthy"]},
-    {"id":27, "name":"Ogbono Soup & Semo",             "type":"Dinner",   "calories":640,"protein":34,"carbs":62,"fat":30,"cost":1100,"allergens":["okra"],             "tags":["Traditional","High-Protein"]},
-    {"id":28, "name":"Turkey & Vegetable Stew & Yam",  "type":"Dinner",   "calories":560,"protein":40,"carbs":60,"fat":14,"cost":1500,"allergens":[],                   "tags":["High-Protein","Balanced","Weight-Loss"]},
-    {"id":29, "name":"Light Vegetable Soup & Plantain","type":"Dinner",   "calories":350,"protein":14,"carbs":55,"fat":8, "cost":650, "allergens":["soy"],              "tags":["Vegan","Low-Calorie","Weight-Loss","Diabetic-Friendly"]},
-    {"id":30, "name":"Goat Meat Stew & Boiled Yam",    "type":"Dinner",   "calories":620,"protein":44,"carbs":58,"fat":22,"cost":1800,"allergens":[],                   "tags":["High-Protein","Traditional","Weekend-Special"]},
+    {"id":21, "name":"Grilled Chicken and Veggies",  "type":"Dinner",   "calories":420,"protein":48,"carbs":18,"fat":16,"allergens":[],                   "tags":["High-Protein","Low-Carb","Weight-Loss","Muscle-Building"]},
+    {"id":22, "name":"Ofe Akwu and Eba",             "type":"Dinner",   "calories":680,"protein":36,"carbs":60,"fat":34,"allergens":[],                   "tags":["High-Protein","Traditional"]},
+    {"id":23, "name":"Beef Pepper Soup",             "type":"Dinner",   "calories":320,"protein":40,"carbs":6, "fat":16,"allergens":[],                   "tags":["Low-Carb","Keto-Friendly","Ulcer-Friendly"]},
+    {"id":24, "name":"Baked Tilapia and Coconut Rice","type":"Dinner",  "calories":540,"protein":40,"carbs":60,"fat":16,"allergens":["fish"],             "tags":["High-Protein","Heart-Healthy"]},
+    {"id":25, "name":"Plantain Frittata",            "type":"Dinner",   "calories":400,"protein":22,"carbs":44,"fat":16,"allergens":["eggs"],             "tags":["High-Protein","Weight-Loss"]},
+    {"id":26, "name":"Vegetable Fried Rice",         "type":"Dinner",   "calories":450,"protein":10,"carbs":82,"fat":9, "allergens":[],                   "tags":["Vegan","Low-Fat","Heart-Healthy"]},
+    {"id":27, "name":"Ogbono Soup and Semo",         "type":"Dinner",   "calories":640,"protein":34,"carbs":62,"fat":30,"allergens":["okra"],             "tags":["Traditional","High-Protein"]},
+    {"id":28, "name":"Turkey Stew and Boiled Yam",   "type":"Dinner",   "calories":560,"protein":40,"carbs":60,"fat":14,"allergens":[],                   "tags":["High-Protein","Weight-Loss"]},
+    {"id":29, "name":"Light Vegetable Soup and Plantain","type":"Dinner","calories":350,"protein":14,"carbs":55,"fat":8,"allergens":["soy"],             "tags":["Vegan","Low-Calorie","Weight-Loss","Diabetic-Friendly"]},
+    {"id":30, "name":"Goat Meat Stew and Yam",       "type":"Dinner",   "calories":620,"protein":44,"carbs":58,"fat":22,"allergens":[],                   "tags":["High-Protein","Traditional"]},
 ]
 
 DAILY_TIPS = [
-    "💡 *Naija Tip:* Swap white garri for unripe plantain fufu — more fibre, lower sugar spike!",
-    "💡 *Naija Tip:* Pepper soup is basically protein broth — great post-workout meal!",
-    "💡 *Naija Tip:* Tiger nuts (aya/ofio) are great for gut health and blood sugar.",
-    "💡 *Naija Tip:* Drink unsweetened zobo — hibiscus can help lower blood pressure slightly.",
-    "💡 *Naija Tip:* Ofada rice has more antioxidants than polished white rice. Switch am!",
-    "💡 *Naija Tip:* Fresh fish 3x per week gives your heart the omega-3 it needs. E good jara!",
-    "💡 *Naija Tip:* Unripe plantain has a low glycaemic index — better for diabetics than ripe.",
-    "💡 *Naija Tip:* A 30-min walk daily can reduce hypertension risk by up to 30%!",
+    "Swap white garri for unripe plantain fufu — more fibre, lower sugar spike.",
+    "Pepper soup is high in protein and very low in carbs. Great after a workout.",
+    "Tiger nuts are excellent for gut health and blood sugar management.",
+    "Unsweetened zobo (hibiscus tea) has been shown to help reduce blood pressure.",
+    "Ofada rice contains more antioxidants than regular polished white rice.",
+    "Fresh fish three times a week provides the omega-3 your heart needs.",
+    "Unripe plantain has a lower glycaemic index than ripe plantain — better for diabetics.",
+    "A 30-minute walk daily can reduce hypertension risk significantly.",
+    "Beans are one of Nigeria's best superfoods — high fibre, high protein, affordable.",
+    "Waterleaf and pumpkin leaves are rich in iron, folate, and vitamins.",
 ]
 
 CONDITION_TAGS = {
-    "diabetes":      ["Diabetic-Friendly","Low-Sugar","Low-Carb","High-Fiber"],
-    "hypertension":  ["Hypertension-Friendly","Low-Fat","High-Fiber","Heart-Healthy"],
-    "cholesterol":   ["Heart-Healthy","Low-Fat","Omega-3"],
-    "ulcer":         ["Ulcer-Friendly","Low-Carb"],
-    "weight loss":   ["Weight-Loss","Low-Calorie","Low-Fat"],
-    "muscle":        ["High-Protein","Muscle-Building"],
+    "diabetes":     ["Diabetic-Friendly","Low-Sugar","Low-Carb","High-Fiber"],
+    "hypertension": ["Hypertension-Friendly","Low-Fat","Heart-Healthy"],
+    "cholesterol":  ["Heart-Healthy","Low-Fat"],
+    "ulcer":        ["Ulcer-Friendly","Low-Carb"],
+    "weight loss":  ["Weight-Loss","Low-Calorie","Low-Fat"],
+    "muscle":       ["High-Protein","Muscle-Building"],
 }
 
 ALLERGEN_MAP = {
-    "groundnut": "groundnut", "peanut": "groundnut",
-    "fish":      "fish",      "seafood": "fish",
-    "egg":       "eggs",      "eggs": "eggs",
-    "milk":      "milk",      "dairy": "milk", "lactose": "milk",
-    "gluten":    "gluten",    "wheat": "gluten",
-    "soy":       "soy",
-    "okra":      "okra",
-    "legume":    "legumes",   "bean": "legumes", "beans": "legumes",
-    "shellfish": "shellfish", "shrimp": "shellfish",
+    "groundnut":"groundnut","peanut":"groundnut",
+    "fish":"fish","seafood":"fish",
+    "egg":"eggs","eggs":"eggs",
+    "milk":"milk","dairy":"milk","lactose":"milk",
+    "gluten":"gluten","wheat":"gluten",
+    "soy":"soy",
+    "okra":"okra",
+    "legume":"legumes","bean":"legumes","beans":"legumes",
+    "shellfish":"shellfish","shrimp":"shellfish",
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -128,20 +166,28 @@ def calc_bmr(weight, height, age, gender):
     return 10 * weight + 6.25 * height - 5 * age - 161
 
 def calc_targets(profile):
-    bmr  = calc_bmr(profile["weight"], profile["height"], profile["age"], profile["gender"])
+    bmr  = calc_bmr(
+        profile.get("weight", 70),
+        profile.get("height", 165),
+        profile.get("age", 25),
+        profile.get("gender", "female")
+    )
     tdee = bmr * profile.get("activity_factor", 1.375)
     goal = profile.get("goal", "wellness").lower()
-    if "loss" in goal:      cal = tdee * 0.80
-    elif "gain" in goal:    cal = tdee * 1.20
-    elif "muscle" in goal:  cal = tdee * 1.10
-    else:                   cal = tdee
-    return {"calories": round(cal), "protein": round(cal * 0.25 / 4),
-            "carbs": round(cal * 0.45 / 4), "fat": round(cal * 0.30 / 9)}
+    if "loss" in goal:     cal = tdee * 0.80
+    elif "gain" in goal:   cal = tdee * 1.20
+    elif "muscle" in goal: cal = tdee * 1.10
+    else:                  cal = tdee
+    return {
+        "calories": round(cal),
+        "protein":  round(cal * 0.25 / 4),
+        "carbs":    round(cal * 0.45 / 4),
+        "fat":      round(cal * 0.30 / 9),
+    }
 
 def filter_meals(profile, meal_type, n=3):
-    allergens   = profile.get("allergens", [])
-    conditions  = profile.get("conditions", [])
-    budget      = profile.get("budget", 3000) / 3 * 1.3  # per-meal budget with 30% flex
+    allergens  = profile.get("allergens", [])
+    conditions = profile.get("conditions", [])
     prefer_tags = []
     for cond in conditions:
         prefer_tags += CONDITION_TAGS.get(cond.lower(), [])
@@ -150,18 +196,13 @@ def filter_meals(profile, meal_type, n=3):
     for meal in MEAL_DB:
         if meal["type"] != meal_type:
             continue
-        # hard filter: allergens
         if any(a in meal["allergens"] for a in allergens):
             continue
-        # hard filter: budget
-        if meal["cost"] > budget:
-            continue
-        # score
         score = 100
         for tag in prefer_tags:
             if tag in meal["tags"]:
                 score += 15
-        scored.append((score + random.randint(0, 10), meal))
+        scored.append((score + random.randint(0, 8), meal))
 
     scored.sort(key=lambda x: -x[0])
     return [m for _, m in scored[:n]]
@@ -173,13 +214,6 @@ def generate_plan(profile):
         plan[mtype] = options[0] if options else None
     return plan
 
-def plan_summary(plan, targets):
-    total_cal  = sum(m["calories"] for m in plan.values() if m)
-    total_prot = sum(m["protein"]  for m in plan.values() if m)
-    total_cost = sum(m["cost"]     for m in plan.values() if m)
-    pct = round(total_cal / targets["calories"] * 100) if targets["calories"] else 0
-    return total_cal, total_prot, total_cost, pct
-
 # ─────────────────────────────────────────────────────────────────────────────
 # NLP INTENT PARSER
 # ─────────────────────────────────────────────────────────────────────────────
@@ -187,78 +221,89 @@ def plan_summary(plan, targets):
 def parse_intent(text: str) -> str:
     t = text.lower().strip()
 
-    if any(w in t for w in ["hi","hello","hey","start","begin","ẹ káàárọ̀","good morning","good afternoon","good evening","howdy","sup"]):
+    if any(w in t for w in ["hi","hello","hey","start","good morning","good afternoon","good evening","howdy","sup","ẹ káàárọ̀"]):
         return "greet"
-    if any(w in t for w in ["menu","help","what can","options","commands","list"]):
+    if any(w in t for w in ["menu","help","what can","options","commands","list","0"]):
         return "menu"
-    if any(w in t for w in ["meal","plan","suggest","eat","food","today","breakfast","lunch","dinner","recommend"]):
+    if t in ["1"] or any(w in t for w in ["meal plan","suggest","today","what should i eat","food today","breakfast lunch dinner"]):
         return "get_plan"
-    if any(w in t for w in ["week","7 day","7-day","weekly"]):
+    if t in ["2"] or any(w in t for w in ["week","7 day","weekly"]):
         return "weekly"
-    if any(w in t for w in ["calorie","macro","target","nutrition","how much should"]):
+    if t in ["3"] or any(w in t for w in ["calorie","macro","target","nutrition","how much should"]):
         return "macros"
-    if any(w in t for w in ["tip","advice","naija tip","health tip","learn"]):
+    if t in ["4"] or any(w in t for w in ["tip","advice","health tip","learn"]):
         return "tip"
-    if any(w in t for w in ["profile","setup","update","change my","edit","set my","my age","my weight","my height"]):
-        return "setup"
-    if any(w in t for w in ["budget","cost","cheap","affordable","price"]):
-        return "budget_info"
-    if any(w in t for w in ["allerg","intoleran","avoid","can't eat","cannot eat","i don't eat","i no dey eat"]):
-        return "allergy_info"
-    if any(w in t for w in ["shopping","buy","market","list","ingredients"]):
-        return "shopping"
-    if any(w in t for w in ["bmi","weight","how fat","how thin","check my"]):
+    if t in ["5"] or any(w in t for w in ["bmi","check my weight","am i fat","am i thin"]):
         return "bmi"
-    if any(w in t for w in ["bye","exit","stop","quit","done"]):
+    if t in ["6"] or any(w in t for w in ["profile","update","change my","set my","edit my"]):
+        return "setup"
+    if t in ["7"] or any(w in t for w in ["shopping","buy","market list","ingredients"]):
+        return "shopping"
+    if t in ["8"] or any(w in t for w in ["about","who made","developer","creator","who built"]):
+        return "about"
+    if any(w in t for w in ["regen","regenerate","new plan","try again","another plan","different"]):
+        return "regen"
+    if any(w in t for w in ["breakfast"]):
+        return "breakfast_only"
+    if any(w in t for w in ["lunch"]):
+        return "lunch_only"
+    if any(w in t for w in ["dinner","supper"]):
+        return "dinner_only"
+    if any(w in t for w in ["yes","yeah","yep","ok","okay","sure","please","go ahead","alright"]):
+        return "affirm"
+    if any(w in t for w in ["no","nope","nah","not now","skip","later"]):
+        return "deny"
+    if any(w in t for w in ["bye","exit","stop","quit","done","thank"]):
         return "bye"
-    if t in [str(i) for i in range(1, 10)]:
-        return f"menu_{t}"
+    if any(w in t for w in ["my name is","i am","i'm","call me"]):
+        return "set_name"
 
     return "unknown"
 
-# ─────────────────────────────────────────────────────────────────────────────
-# QUICK PROFILE EXTRACTOR FROM FREE TEXT
-# (e.g. "I am 28, female, 62kg, 165cm, weight loss, budget 2000")
-# ─────────────────────────────────────────────────────────────────────────────
+def extract_name(text: str) -> str:
+    """Try to pull a name from intro text"""
+    patterns = [
+        r"my name is ([A-Za-z]+)",
+        r"i'm ([A-Za-z]+)",
+        r"i am ([A-Za-z]+)",
+        r"call me ([A-Za-z]+)",
+        r"^([A-Za-z]+)$",  # single word = likely just a name
+    ]
+    for p in patterns:
+        m = re.search(p, text.lower())
+        if m:
+            name = m.group(1).capitalize()
+            # filter out common words
+            if name.lower() not in ["fine","good","well","okay","ok","yes","no","here","there","ready"]:
+                return name
+    return None
 
 def extract_profile_from_text(text: str) -> dict:
     profile = {}
     t = text.lower()
 
-    # Age
     age_match = re.search(r'\b(\d{1,2})\s*(years?|yrs?|yr)?\s*(old)?\b', t)
     if age_match:
         age = int(age_match.group(1))
         if 10 <= age <= 100:
             profile["age"] = age
 
-    # Gender
-    if any(w in t for w in ["female","woman","girl","lady","she/her"]):
+    if any(w in t for w in ["female","woman","girl","lady"]):
         profile["gender"] = "female"
-    elif any(w in t for w in ["male","man","guy","boy","he/him"]):
+    elif any(w in t for w in ["male","man","guy","boy"]):
         profile["gender"] = "male"
 
-    # Weight (kg)
     w_match = re.search(r'(\d{2,3})\s*kg', t)
     if w_match:
         profile["weight"] = int(w_match.group(1))
 
-    # Height (cm)
     h_match = re.search(r'(\d{3})\s*cm', t)
     if h_match:
         profile["height"] = int(h_match.group(1))
 
-    # Budget
-    b_match = re.search(r'(?:₦|naira|budget|ngn)\s*(\d{3,6})', t)
-    if not b_match:
-        b_match = re.search(r'(\d{3,6})\s*(?:₦|naira|ngn)', t)
-    if b_match:
-        profile["budget"] = int(b_match.group(1))
-
-    # Goal
-    if any(w in t for w in ["lose weight","weight loss","slim","slimming","cut down","reduce"]):
+    if any(w in t for w in ["lose weight","weight loss","slim","slimming","cut","reduce weight"]):
         profile["goal"] = "weight loss"
-    elif any(w in t for w in ["gain weight","bulk","bulking","add weight"]):
+    elif any(w in t for w in ["gain weight","bulk","add weight"]):
         profile["goal"] = "weight gain"
     elif any(w in t for w in ["muscle","build","gym","strength"]):
         profile["goal"] = "muscle building"
@@ -267,21 +312,19 @@ def extract_profile_from_text(text: str) -> dict:
     elif any(w in t for w in ["energy","active","fit"]):
         profile["goal"] = "energy boost"
 
-    # Activity
     if any(w in t for w in ["very active","athlete","intense","daily gym"]):
         profile["activity_factor"] = 1.725
-    elif any(w in t for w in ["moderately","moderate","3-5","gym sometimes"]):
+    elif any(w in t for w in ["moderately","moderate","gym sometimes"]):
         profile["activity_factor"] = 1.55
-    elif any(w in t for w in ["lightly","light","1-3","walk sometimes"]):
+    elif any(w in t for w in ["lightly","light","walk sometimes"]):
         profile["activity_factor"] = 1.375
     elif any(w in t for w in ["sedentary","office","no exercise","desk"]):
         profile["activity_factor"] = 1.2
 
-    # Conditions
     conditions = []
-    if any(w in t for w in ["diabetes","diabetic","type 2","blood sugar"]):
+    if any(w in t for w in ["diabetes","diabetic","type 2"]):
         conditions.append("diabetes")
-    if any(w in t for w in ["hypertension","high blood pressure","bp"]):
+    if any(w in t for w in ["hypertension","high blood pressure"]):
         conditions.append("hypertension")
     if any(w in t for w in ["cholesterol","high cholesterol"]):
         conditions.append("cholesterol")
@@ -290,7 +333,6 @@ def extract_profile_from_text(text: str) -> dict:
     if conditions:
         profile["conditions"] = conditions
 
-    # Allergens
     user_allergens = []
     for key, val in ALLERGEN_MAP.items():
         if key in t and val not in user_allergens:
@@ -304,352 +346,540 @@ def extract_profile_from_text(text: str) -> dict:
 # RESPONSE BUILDERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-MAIN_MENU = """🍲 *NaijaPlate AI Menu*
-━━━━━━━━━━━━━━━━━━━
-Reply with a number or just type naturally:
+def name_or_friend(session: dict) -> str:
+    return session.get("name") or "friend"
 
-*1* — 🍽️ Get today's meal plan
-*2* — 📅 Get weekly meal plan
-*3* — 🧮 See my calorie targets
-*4* — 🛒 Shopping list
-*5* — 💡 Health tip
-*6* — ⚖️ Check my BMI
-*7* — 👤 Update my profile
-*8* — ℹ️ About NaijaPlate AI
+def welcome_new(session: dict) -> str:
+    greeting = get_greeting()
+    return (
+        f"{greeting}! Welcome to *NaijaPlate AI* — your smart Nigerian meal planner.\n\n"
+        f"I can suggest personalised breakfast, lunch, and dinner based on your health goals, "
+        f"allergies, and medical conditions — all with authentic Nigerian dishes.\n\n"
+        f"First, what's your name?"
+    )
 
-Or just type what you want, e.g:
-_"suggest a diabetic-friendly lunch"_
-_"I want to lose weight, I'm 75kg"_"""
+def welcome_back(session: dict) -> str:
+    greeting = get_greeting()
+    name = name_or_friend(session)
+    time_note = get_time_tip()
+    return (
+        f"{greeting}, {name}! Good to have you back.\n\n"
+        f"{time_note}\n\n"
+        f"Reply *MENU* to see all options or just tell me what you need."
+    )
 
-def welcome_msg(is_new: bool) -> str:
-    if is_new:
-        return """🇳🇬 *Welcome to NaijaPlate AI!* 🍲
+MAIN_MENU = (
+    "*NaijaPlate AI — Main Menu*\n"
+    "━━━━━━━━━━━━━━━━━━━\n"
+    "Reply with a number:\n\n"
+    "1 — Get today's meal plan\n"
+    "2 — Get weekly meal plan\n"
+    "3 — See my calorie targets\n"
+    "4 — Health tip\n"
+    "5 — Check my BMI\n"
+    "6 — Update my profile\n"
+    "7 — Shopping list\n"
+    "8 — About NaijaPlate AI\n\n"
+    "Or just type naturally, e.g:\n"
+    "_\"suggest a diabetic-friendly lunch\"_\n"
+    "_\"I want to lose weight, I'm 75kg\"_"
+)
 
-Your smart Nigerian meal planner on WhatsApp!
+def format_meal_card(meal: dict, meal_type: str) -> str:
+    return (
+        f"*{meal_type}*\n"
+        f"{meal['name']}\n"
+        f"{meal['calories']} kcal  |  {meal['protein']}g protein  |  {meal['carbs']}g carbs"
+    )
 
-To get started, tell me a bit about yourself. Just type naturally, e.g:
+def format_meal_plan(plan: dict, profile: dict, name: str) -> str:
+    targets = calc_targets(profile) if profile.get("weight") else {"calories": 2000, "protein": 125}
+    total_cal  = sum(m["calories"] for m in plan.values() if m)
+    total_prot = sum(m["protein"]  for m in plan.values() if m)
+    pct = round(total_cal / targets["calories"] * 100) if targets["calories"] else 0
 
-_"I'm 28, female, 68kg, 165cm, want to lose weight, budget ₦2500, I don't eat fish"_
-
-Or type *MENU* to see all options.
-
-E go sweet! 😄"""
-    return f"""👋 Welcome back to *NaijaPlate AI!*
-
-Type *MENU* to see options or just tell me what you need.
-E.g: _"Give me today's meal plan"_"""
-
-def format_meal_plan(plan, profile) -> str:
-    targets = calc_targets(profile) if profile.get("weight") else {"calories": 2000, "protein": 125, "carbs": 225, "fat": 67}
-    total_cal, total_prot, total_cost, pct = plan_summary(plan, targets)
-
-    lines = ["🍽️ *Today's NaijaPlate Meal Plan*", "━━━━━━━━━━━━━━━━━━━"]
-    emojis = {"Breakfast": "🌅", "Lunch": "☀️", "Dinner": "🌙"}
-
+    lines = [f"*Today's Meal Plan for {name}*", "━━━━━━━━━━━━━━━━━━━"]
     for mtype in ["Breakfast", "Lunch", "Dinner"]:
         meal = plan.get(mtype)
         if meal:
-            lines.append(f"\n{emojis[mtype]} *{mtype}*")
-            lines.append(f"🍲 {meal['name']}")
-            lines.append(f"🔥 {meal['calories']} kcal  💪 {meal['protein']}g protein  💰 ₦{meal['cost']:,}")
-            if meal.get("tags"):
-                lines.append(f"🏷️ {' · '.join(meal['tags'][:3])}")
+            lines.append(f"\n{format_meal_card(meal, mtype)}")
         else:
-            lines.append(f"\n{emojis[mtype]} *{mtype}*")
-            lines.append("⚠️ No match found — try updating your budget or allergies")
+            lines.append(f"\n*{mtype}*\nNo match found — try updating your profile")
 
     lines.append("\n━━━━━━━━━━━━━━━━━━━")
-    lines.append(f"📊 *Daily Totals*")
-    lines.append(f"🔥 {total_cal} kcal ({pct}% of your {targets['calories']} kcal target)")
-    lines.append(f"💪 {total_prot}g protein  💰 ₦{total_cost:,} total")
-    lines.append("\nReply *MENU* for more options or *REGEN* to regenerate 🔄")
+    lines.append(f"*Daily Total:* {total_cal} kcal ({pct}% of your {targets['calories']} kcal target)")
+    lines.append(f"Protein: {total_prot}g")
+    lines.append("\nReply *MENU* for more options or *REGEN* for a different plan.")
     return "\n".join(lines)
 
-def format_weekly_plan(profile) -> str:
+def format_single_meal(meal: dict, meal_type: str) -> str:
+    tags = ", ".join(meal["tags"][:3]) if meal.get("tags") else ""
+    lines = [
+        f"*{meal_type} Suggestion*",
+        "━━━━━━━━━━━━━━━━━━━",
+        f"*{meal['name']}*",
+        f"{meal['calories']} kcal  |  {meal['protein']}g protein  |  {meal['carbs']}g carbs",
+    ]
+    if tags:
+        lines.append(f"_{tags}_")
+    lines.append("\nWant another option? Reply *REGEN* or ask for a different meal.")
+    return "\n".join(lines)
+
+def format_weekly(profile: dict, name: str) -> str:
     days = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
-    lines = ["📅 *Your 7-Day NaijaPlate Plan*", "━━━━━━━━━━━━━━━━━━━"]
-    used = []
+    lines = [f"*7-Day Meal Plan for {name}*", "━━━━━━━━━━━━━━━━━━━"]
     for day in days:
         plan = generate_plan(profile)
         lines.append(f"\n*{day}*")
         for mtype in ["Breakfast","Lunch","Dinner"]:
             m = plan.get(mtype)
             if m:
-                lines.append(f"  {'🌅' if mtype=='Breakfast' else '☀️' if mtype=='Lunch' else '🌙'} {m['name']} (₦{m['cost']:,})")
+                lines.append(f"  {mtype}: {m['name']}")
     lines.append("\n━━━━━━━━━━━━━━━━━━━")
-    lines.append("Reply *SHOP* for the full shopping list 🛒")
+    lines.append("Reply *7* for the shopping list to go with this plan.")
     return "\n".join(lines)
 
-def format_macros(profile) -> str:
+def format_macros(profile: dict, name: str) -> str:
     if not profile.get("weight"):
-        return ("⚠️ I need your profile to calculate targets!\n\n"
-                "Tell me: _\"I'm 30, male, 75kg, 175cm, moderately active\"_")
+        return (
+            f"I need a bit more about you, {name}, to calculate your targets.\n\n"
+            "Please tell me: your weight (kg), height (cm), age, and goal.\n"
+            "Example: _\"I'm 28, female, 65kg, 163cm, I want to lose weight\"_"
+        )
     t = calc_targets(profile)
-    bmi = round(profile["weight"] / ((profile["height"]/100)**2), 1) if profile.get("height") else "?"
-    cat = ("Underweight" if isinstance(bmi,float) and bmi<18.5
-           else "Healthy ✅" if isinstance(bmi,float) and bmi<25
-           else "Overweight ⚠️" if isinstance(bmi,float) and bmi<30
-           else "Obese 🔴")
-    return f"""🧮 *Your Daily Nutrition Targets*
-━━━━━━━━━━━━━━━━━━━
-⚖️ BMI: *{bmi}* ({cat})
-🎯 Goal: *{profile.get('goal','General Wellness').title()}*
+    bmi = round(profile["weight"] / ((profile.get("height",165)/100)**2), 1)
+    if bmi < 18.5:   cat = "Underweight"
+    elif bmi < 25:   cat = "Healthy weight"
+    elif bmi < 30:   cat = "Overweight"
+    else:            cat = "Obese"
+    return (
+        f"*Daily Nutrition Targets — {name}*\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"BMI: {bmi} ({cat})\n"
+        f"Goal: {profile.get('goal','General Wellness').title()}\n\n"
+        f"Calories: *{t['calories']} kcal/day*\n"
+        f"Protein:  *{t['protein']}g/day*\n"
+        f"Carbs:    *{t['carbs']}g/day*\n"
+        f"Fat:      *{t['fat']}g/day*\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"Reply *1* to get a meal plan that hits these targets."
+    )
 
-🔥 Calories: *{t['calories']} kcal/day*
-💪 Protein:  *{t['protein']}g/day*
-🍞 Carbs:    *{t['carbs']}g/day*
-🥑 Fat:      *{t['fat']}g/day*
+def format_bmi(profile: dict, name: str) -> str:
+    if not profile.get("weight") or not profile.get("height"):
+        return (
+            f"To check your BMI, {name}, I need your weight and height.\n\n"
+            "Just tell me, e.g: _\"I'm 75kg and 175cm\"_"
+        )
+    bmi = round(profile["weight"] / ((profile["height"]/100)**2), 1)
+    if bmi < 18.5:
+        cat, advice = "Underweight", "You may need to eat more nutritious, calorie-rich meals. I can build you a weight gain plan."
+    elif bmi < 25:
+        cat, advice = "Healthy weight", "You are in great shape. Let's keep it that way with balanced meals."
+    elif bmi < 30:
+        cat, advice = "Overweight", "Reducing refined carbs and fried foods will help. Want a weight loss meal plan?"
+    else:
+        cat, advice = "Obese", "I recommend seeing a doctor alongside using a structured meal plan. I can help with the meals."
+    return (
+        f"*BMI Check — {name}*\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"Weight: {profile['weight']}kg\n"
+        f"Height: {profile['height']}cm\n"
+        f"BMI:    {bmi}\n"
+        f"Status: *{cat}*\n\n"
+        f"{advice}\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"Reply *1* for a personalised meal plan."
+    )
 
-💰 Daily Budget: *₦{profile.get('budget',3000):,}*
-━━━━━━━━━━━━━━━━━━━
-These targets are based on your profile.
-Reply *1* to get a meal plan that hits these targets!"""
-
-def format_shopping(profile) -> str:
-    all_ingredients = {}
-    for _ in range(7):  # week's worth
+def format_shopping(profile: dict, name: str) -> str:
+    ingredient_count = {}
+    for _ in range(7):
         plan = generate_plan(profile)
         for meal in plan.values():
             if meal:
-                for ing in meal.get("ingredients", [meal["name"]]):
-                    all_ingredients[ing] = all_ingredients.get(ing, 0) + 1
+                # Use meal name words as proxy ingredients
+                for ing in meal.get("allergens", []) + [meal["name"].split()[0].lower()]:
+                    ingredient_count[ing] = ingredient_count.get(ing, 0) + 1
 
-    lines = ["🛒 *Weekly Shopping List*", "━━━━━━━━━━━━━━━━━━━"]
-    for item, count in sorted(all_ingredients.items(), key=lambda x: -x[1])[:20]:
-        lines.append(f"• {item.title()} ×{count}")
+    # Build a representative shopping list from meal names
+    all_meals = []
+    for _ in range(7):
+        plan = generate_plan(profile)
+        for meal in plan.values():
+            if meal and meal["name"] not in all_meals:
+                all_meals.append(meal["name"])
+
+    lines = [f"*Weekly Shopping Guide — {name}*", "━━━━━━━━━━━━━━━━━━━"]
+    lines.append("Based on your 7-day plan, stock up on:\n")
+    lines.append("*Proteins:* chicken, fish, beef, eggs, beans")
+    lines.append("*Grains & Swallows:* rice, yam, garri, oats, semolina")
+    lines.append("*Vegetables:* tomatoes, pepper, onion, spinach, pumpkin leaf")
+    lines.append("*Pantry:* palm oil, crayfish, seasoning, locust beans")
+    lines.append("*Fruits & Extras:* plantain, tiger nuts, coconut milk")
     lines.append("\n━━━━━━━━━━━━━━━━━━━")
-    lines.append(f"💡 Pro tip: Shop at your local market on weekends for the best prices!")
+    lines.append("Shop at your local market on weekends for the best fresh produce and prices.")
     return "\n".join(lines)
 
-def format_bmi(profile) -> str:
-    if not profile.get("weight") or not profile.get("height"):
-        return ("⚠️ I need your weight and height to calculate BMI.\n\n"
-                "Tell me: _\"I'm 75kg, 175cm\"_")
-    bmi = round(profile["weight"] / ((profile["height"]/100)**2), 1)
-    if bmi < 18.5:   cat, advice = "Underweight 📉", "You need to eat more nutritious meals. Consider weight gain plan!"
-    elif bmi < 25:   cat, advice = "Healthy Weight ✅", "You're in great shape! Focus on maintaining with balanced meals."
-    elif bmi < 30:   cat, advice = "Overweight ⚠️", "Time to cut down on carbs & fried food. I can help with a weight loss plan!"
-    else:            cat, advice = "Obese 🔴", "Please see a doctor and let's get you on a structured meal plan."
-    return f"""⚖️ *Your BMI Check*
-━━━━━━━━━━━━━━━━━━━
-Weight: *{profile['weight']}kg*
-Height: *{profile['height']}cm*
-BMI:    *{bmi}*
-Status: *{cat}*
-
-💬 {advice}
-━━━━━━━━━━━━━━━━━━━
-Reply *1* to get a personalised meal plan!"""
-
-def format_profile_confirm(profile) -> str:
-    lines = ["✅ *Profile Updated!*", "━━━━━━━━━━━━━━━━━━━"]
-    if profile.get("age"):       lines.append(f"🎂 Age: {profile['age']} yrs")
-    if profile.get("gender"):    lines.append(f"👤 Gender: {profile['gender'].title()}")
-    if profile.get("weight"):    lines.append(f"⚖️ Weight: {profile['weight']}kg")
-    if profile.get("height"):    lines.append(f"📏 Height: {profile['height']}cm")
-    if profile.get("goal"):      lines.append(f"🎯 Goal: {profile['goal'].title()}")
-    if profile.get("budget"):    lines.append(f"💰 Budget: ₦{profile['budget']:,}/day")
-    if profile.get("allergens"): lines.append(f"⚠️ Allergies: {', '.join(profile['allergens'])}")
-    if profile.get("conditions"):lines.append(f"🏥 Conditions: {', '.join(profile['conditions'])}")
-    lines.append("\nReply *1* to get your personalised meal plan now! 🍽️")
+def format_profile_confirm(profile: dict, name: str) -> str:
+    lines = [f"*Profile updated, {name}!*", "━━━━━━━━━━━━━━━━━━━"]
+    if profile.get("age"):       lines.append(f"Age: {profile['age']} years")
+    if profile.get("gender"):    lines.append(f"Gender: {profile['gender'].title()}")
+    if profile.get("weight"):    lines.append(f"Weight: {profile['weight']}kg")
+    if profile.get("height"):    lines.append(f"Height: {profile['height']}cm")
+    if profile.get("goal"):      lines.append(f"Goal: {profile['goal'].title()}")
+    if profile.get("allergens"): lines.append(f"Allergies: {', '.join(profile['allergens'])}")
+    if profile.get("conditions"):lines.append(f"Conditions: {', '.join(profile['conditions'])}")
+    lines.append("\nShall I generate your meal plan now? Reply *yes* or *1*.")
     return "\n".join(lines)
 
+ABOUT_MSG = (
+    "*About NaijaPlate AI*\n"
+    "━━━━━━━━━━━━━━━━━━━\n"
+    "NaijaPlate AI is a smart Nigerian meal planning assistant built to help everyday Nigerians "
+    "eat better, live healthier, and stay within their budget — all through WhatsApp.\n\n"
+    "*Features:*\n"
+    "- 64 authentic Nigerian dishes\n"
+    "- Personalised meal plans based on your health goals\n"
+    "- Supports allergies and medical conditions (diabetes, hypertension, ulcer, and more)\n"
+    "- Calorie and macro tracking\n"
+    "- Weekly plans and shopping guides\n"
+    "- Available 24/7 on WhatsApp\n\n"
+    "*Developer:*\n"
+    "Built by *James*, a software developer passionate about using technology to solve real Nigerian "
+    "health and lifestyle problems. NaijaPlate AI is James's vision of making personalised nutrition "
+    "accessible to every Nigerian — not just those who can afford a dietitian.\n\n"
+    "For enquiries or feedback, reply *hello* to start a conversation.\n"
+    "━━━━━━━━━━━━━━━━━━━\n"
+    "Reply *MENU* to get started."
+)
+
 # ─────────────────────────────────────────────────────────────────────────────
-# MAIN CONVERSATION HANDLER
+# CONVERSATION HANDLER
 # ─────────────────────────────────────────────────────────────────────────────
+
+FALLBACKS = [
+    "I didn't quite catch that. Reply *MENU* to see what I can help with, or just describe what you need.",
+    "Not sure I understood. Try something like _\"give me a meal plan\"_ or reply *MENU* for options.",
+    "Let me know how I can help — reply *MENU* for the full list of options.",
+]
 
 def handle_message(phone: str, text: str) -> str:
     session = get_session(phone)
     profile = session.get("profile", {})
+    name    = name_or_friend(session)
     intent  = parse_intent(text)
-    t       = text.lower().strip()
+    t       = text.strip()
 
-    # ── Handle REGEN shortcut ──────────────────────────────────────────────
-    if t in ["regen", "regenerate", "new plan", "try again"]:
-        plan = generate_plan(profile) if profile.get("weight") else generate_plan({"budget":3000,"allergens":[],"conditions":[]})
-        session["last_plan"] = plan
-        save_session(phone, session)
-        return format_meal_plan(plan, profile)
+    add_history(session, "user", t)
 
-    if t in ["shop", "shopping"]:
-        return format_shopping(profile or {"budget":3000,"allergens":[],"conditions":[]})
-
-    # ── Handle numbered menu shortcuts ────────────────────────────────────
-    menu_map = {
-        "1": "get_plan", "2": "weekly", "3": "macros",
-        "4": "shopping", "5": "tip",    "6": "bmi",
-        "7": "setup",    "8": "about",
-    }
-    if t in menu_map:
-        intent = menu_map[t]
-
-    # ── WELCOME / GREET ───────────────────────────────────────────────────
-    if intent == "greet" or session["step"] == "welcome":
-        is_new = not bool(profile.get("weight"))
-        session["step"] = "idle"
-        save_session(phone, session)
-        return welcome_msg(is_new)
-
-    # ── MAIN MENU ─────────────────────────────────────────────────────────
-    if intent == "menu":
-        return MAIN_MENU
-
-    # ── GET TODAY'S MEAL PLAN ─────────────────────────────────────────────
-    if intent == "get_plan":
-        p = profile if profile.get("weight") else {"budget":3000,"allergens":[],"conditions":[],"activity_factor":1.375,"goal":"wellness"}
-        plan = generate_plan(p)
-        session["last_plan"] = plan
-        save_session(phone, session)
-        return format_meal_plan(plan, p)
-
-    # ── WEEKLY PLAN ───────────────────────────────────────────────────────
-    if intent == "weekly":
-        p = profile if profile.get("weight") else {"budget":3000,"allergens":[],"conditions":[],"activity_factor":1.375}
-        return format_weekly_plan(p)
-
-    # ── MACROS / TARGETS ──────────────────────────────────────────────────
-    if intent == "macros":
-        return format_macros(profile)
-
-    # ── TIP ───────────────────────────────────────────────────────────────
-    if intent == "tip":
-        return random.choice(DAILY_TIPS) + "\n\nReply *MENU* for more options."
-
-    # ── BMI ───────────────────────────────────────────────────────────────
-    if intent == "bmi":
-        return format_bmi(profile)
-
-    # ── SHOPPING LIST ─────────────────────────────────────────────────────
-    if intent == "shopping":
-        p = profile if profile.get("weight") else {"budget":3000,"allergens":[],"conditions":[]}
-        return format_shopping(p)
-
-    # ── SETUP / UPDATE PROFILE ────────────────────────────────────────────
-    if intent == "setup":
-        session["step"] = "collecting_profile"
-        save_session(phone, session)
-        return """👤 *Update Your Profile*
-━━━━━━━━━━━━━━━━━━━
-Just tell me about yourself in one message! E.g:
-
-_"I'm 28, female, 62kg, 165cm, want to lose weight, budget ₦2000, I don't eat fish or eggs, I have diabetes"_
-
-Include whatever applies to you — age, gender, weight (kg), height (cm), goal, daily budget in ₦, allergies, and medical conditions."""
-
-    # ── ABOUT ─────────────────────────────────────────────────────────────
-    if intent == "about":
-        return """ℹ️ *About NaijaPlate AI*
-━━━━━━━━━━━━━━━━━━━
-🇳🇬 NaijaPlate AI is your smart Nigerian meal planner built with love for everyday Nigerians.
-
-✅ 64 authentic Nigerian dishes
-✅ Personalised to your health goals
-✅ Works with your daily budget
-✅ Manages allergies & medical conditions
-✅ Calculates your calorie & macro targets
-✅ Available 24/7 on WhatsApp
-
-*Built for Nigeria, by Nigerians.* 💚
-
-Type *MENU* to get started!"""
-
-    # ── BYE ───────────────────────────────────────────────────────────────
-    if intent == "bye":
-        return "👋 Take care and *chop well*! Come back anytime for your NaijaPlate meal plan. 🍲🇳🇬"
-
-    # ── PROFILE COLLECTION (multi-turn) ───────────────────────────────────
-    if session["step"] == "collecting_profile":
-        extracted = extract_profile_from_text(text)
-        if extracted:
-            # Merge with existing profile
-            profile.update(extracted)
-            session["profile"] = profile
-            session["step"] = "idle"
+    # ── Awaiting name after welcome ────────────────────────────────────────
+    if session.get("awaiting") == "name":
+        extracted_name = extract_name(t)
+        if extracted_name:
+            session["name"] = extracted_name
+            name = extracted_name
+            session["awaiting"] = None
             save_session(phone, session)
-            reply = format_profile_confirm(profile)
+            reply = (
+                f"Nice to meet you, {name}!\n\n"
+                f"I'm here to help you eat well with authentic Nigerian meals tailored to your goals.\n\n"
+                f"To get started, tell me a bit about yourself — your age, weight, height, and what you want to achieve. "
+                f"For example:\n_\"I'm 28, female, 65kg, 163cm, I want to lose weight, I don't eat fish\"_\n\n"
+                f"Or reply *MENU* to explore what I can do."
+            )
+            add_history(session, "bot", reply)
+            save_session(phone, session)
             return reply
         else:
-            return ("🤔 I couldn't quite catch your details. Try something like:\n\n"
-                    "_\"I'm 28, female, 62kg, 165cm, lose weight, budget ₦2500, no fish\"_\n\n"
-                    "Or type *MENU* to explore options.")
+            # Accept whatever they said as name if no profile yet
+            words = t.split()
+            if len(words) <= 2 and t.isalpha():
+                session["name"] = t.capitalize()
+                name = session["name"]
+                session["awaiting"] = None
+                save_session(phone, session)
+                reply = (
+                    f"Nice to meet you, {name}!\n\n"
+                    f"Tell me about yourself so I can personalise your meal plans.\n"
+                    f"Example: _\"I'm 30, male, 80kg, 175cm, moderately active, want to build muscle\"_\n\n"
+                    f"Or reply *MENU* to explore options."
+                )
+                add_history(session, "bot", reply)
+                save_session(phone, session)
+                return reply
 
-    # ── FREE TEXT PROFILE UPDATE (any message that has profile info) ───────
-    extracted = extract_profile_from_text(text)
-    if extracted and len(extracted) >= 2:  # at least 2 fields detected
+    # ── Awaiting profile update ────────────────────────────────────────────
+    if session.get("awaiting") == "profile":
+        extracted = extract_profile_from_text(t)
+        if extracted:
+            profile.update(extracted)
+            session["profile"] = profile
+            session["awaiting"] = None
+            save_session(phone, session)
+            reply = format_profile_confirm(profile, name)
+            add_history(session, "bot", reply)
+            save_session(phone, session)
+            return reply
+        else:
+            reply = (
+                f"I couldn't pick up your details from that, {name}. "
+                f"Please try again, e.g:\n"
+                f"_\"I'm 28, female, 62kg, 165cm, lose weight, no fish\"_"
+            )
+            add_history(session, "bot", reply)
+            return reply
+
+    # ── Affirm (yes) after prompts ─────────────────────────────────────────
+    if intent == "affirm" and session.get("last_prompt") == "offer_plan":
+        intent = "get_plan"
+
+    # ── REGEN ──────────────────────────────────────────────────────────────
+    if intent == "regen" or t.lower() in ["regen","regenerate"]:
+        p = profile if profile.get("weight") else {"allergens":[],"conditions":[]}
+        plan = generate_plan(p)
+        session["last_plan"] = plan
+        session["last_prompt"] = None
+        save_session(phone, session)
+        reply = format_meal_plan(plan, p, name)
+        add_history(session, "bot", reply)
+        return reply
+
+    # ── GREET ──────────────────────────────────────────────────────────────
+    if intent == "greet":
+        if session["step"] == "new":
+            session["step"] = "onboarding"
+            session["awaiting"] = "name"
+            save_session(phone, session)
+            reply = welcome_new(session)
+        else:
+            reply = welcome_back(session)
+        add_history(session, "bot", reply)
+        save_session(phone, session)
+        return reply
+
+    # ── First message ever (no greet detected) ─────────────────────────────
+    if session["step"] == "new":
+        session["step"] = "onboarding"
+        # Try to extract name from first message
+        extracted_name = extract_name(t)
+        if extracted_name:
+            session["name"] = extracted_name
+            name = extracted_name
+            session["awaiting"] = None
+        else:
+            session["awaiting"] = "name"
+        save_session(phone, session)
+        reply = welcome_new(session)
+        add_history(session, "bot", reply)
+        save_session(phone, session)
+        return reply
+
+    # ── SET NAME ───────────────────────────────────────────────────────────
+    if intent == "set_name":
+        extracted_name = extract_name(t)
+        if extracted_name:
+            session["name"] = extracted_name
+            name = extracted_name
+            save_session(phone, session)
+            reply = f"Got it! I'll call you {name} from now on. How can I help you today?"
+        else:
+            reply = "What would you like me to call you?"
+        add_history(session, "bot", reply)
+        return reply
+
+    # ── MENU ───────────────────────────────────────────────────────────────
+    if intent == "menu":
+        add_history(session, "bot", MAIN_MENU)
+        return MAIN_MENU
+
+    # ── TODAY'S PLAN ───────────────────────────────────────────────────────
+    if intent == "get_plan":
+        p = profile if profile.get("weight") else {"allergens":[],"conditions":[]}
+        plan = generate_plan(p)
+        session["last_plan"] = plan
+        session["last_prompt"] = None
+        save_session(phone, session)
+        if not profile.get("weight"):
+            reply = (
+                format_meal_plan(plan, p, name) +
+                f"\n\n_Tip: Tell me your age, weight, height, and goal to get a fully personalised plan, {name}._"
+            )
+        else:
+            reply = format_meal_plan(plan, p, name)
+        add_history(session, "bot", reply)
+        return reply
+
+    # ── SINGLE MEAL SUGGESTIONS ────────────────────────────────────────────
+    if intent == "breakfast_only":
+        options = filter_meals(profile if profile else {}, "Breakfast", n=3)
+        meal = options[0] if options else None
+        if meal:
+            reply = format_single_meal(meal, "Breakfast")
+        else:
+            reply = "I couldn't find a matching breakfast. Try updating your profile with *6*."
+        add_history(session, "bot", reply)
+        return reply
+
+    if intent == "lunch_only":
+        options = filter_meals(profile if profile else {}, "Lunch", n=3)
+        meal = options[0] if options else None
+        if meal:
+            reply = format_single_meal(meal, "Lunch")
+        else:
+            reply = "No matching lunch found. Update your profile with *6* to improve suggestions."
+        add_history(session, "bot", reply)
+        return reply
+
+    if intent == "dinner_only":
+        options = filter_meals(profile if profile else {}, "Dinner", n=3)
+        meal = options[0] if options else None
+        if meal:
+            reply = format_single_meal(meal, "Dinner")
+        else:
+            reply = "No matching dinner found. Update your profile with *6* to improve suggestions."
+        add_history(session, "bot", reply)
+        return reply
+
+    # ── WEEKLY ─────────────────────────────────────────────────────────────
+    if intent == "weekly":
+        p = profile if profile.get("weight") else {"allergens":[],"conditions":[]}
+        reply = format_weekly(p, name)
+        add_history(session, "bot", reply)
+        return reply
+
+    # ── MACROS ─────────────────────────────────────────────────────────────
+    if intent == "macros":
+        reply = format_macros(profile, name)
+        add_history(session, "bot", reply)
+        return reply
+
+    # ── TIP ────────────────────────────────────────────────────────────────
+    if intent == "tip":
+        tip = random.choice(DAILY_TIPS)
+        reply = f"*Health Tip*\n\n{tip}\n\nReply *MENU* for more options."
+        add_history(session, "bot", reply)
+        return reply
+
+    # ── BMI ────────────────────────────────────────────────────────────────
+    if intent == "bmi":
+        reply = format_bmi(profile, name)
+        add_history(session, "bot", reply)
+        return reply
+
+    # ── SETUP / UPDATE PROFILE ─────────────────────────────────────────────
+    if intent == "setup":
+        session["awaiting"] = "profile"
+        save_session(phone, session)
+        reply = (
+            f"Sure, {name}! Tell me about yourself in one message:\n\n"
+            f"_\"I'm 28, female, 62kg, 165cm, want to lose weight, I don't eat fish or eggs, I have diabetes\"_\n\n"
+            f"Include whatever applies — age, gender, weight, height, goal, allergies, medical conditions."
+        )
+        add_history(session, "bot", reply)
+        return reply
+
+    # ── SHOPPING ───────────────────────────────────────────────────────────
+    if intent == "shopping":
+        p = profile if profile.get("weight") else {"allergens":[],"conditions":[]}
+        reply = format_shopping(p, name)
+        add_history(session, "bot", reply)
+        return reply
+
+    # ── ABOUT ──────────────────────────────────────────────────────────────
+    if intent == "about":
+        add_history(session, "bot", ABOUT_MSG)
+        return ABOUT_MSG
+
+    # ── BYE ────────────────────────────────────────────────────────────────
+    if intent == "bye":
+        reply = f"Take care, {name}! Come back whenever you need a meal plan. Eat well and stay healthy."
+        add_history(session, "bot", reply)
+        return reply
+
+    # ── DENY ───────────────────────────────────────────────────────────────
+    if intent == "deny":
+        reply = f"No problem, {name}. Reply *MENU* whenever you're ready."
+        add_history(session, "bot", reply)
+        return reply
+
+    # ── FREE TEXT PROFILE DETECTION ────────────────────────────────────────
+    extracted = extract_profile_from_text(t)
+    if extracted and len(extracted) >= 2:
         profile.update(extracted)
         session["profile"] = profile
-        session["step"] = "idle"
+        session["step"] = "active"
         save_session(phone, session)
-        confirm = format_profile_confirm(profile)
-        plan = generate_plan(profile)
-        session["last_plan"] = plan
+        confirm = format_profile_confirm(profile, name)
+        session["last_prompt"] = "offer_plan"
         save_session(phone, session)
-        return confirm + "\n\n" + format_meal_plan(plan, profile)
+        add_history(session, "bot", confirm)
+        return confirm
 
-    # ── UNKNOWN ───────────────────────────────────────────────────────────
-    fallbacks = [
-        "🤔 I didn't quite get that. Type *MENU* to see what I can do!",
-        "😄 Omo, I no understand that one! Try typing *MENU* or *1* for a meal plan.",
-        "🍲 Hmm, not sure what you mean. Type *MENU* for options or *1* for today's meal plan!",
-    ]
-    return random.choice(fallbacks)
+    # ── CONTEXTUAL FALLBACK ────────────────────────────────────────────────
+    # If we have conversation history, give a context-aware nudge
+    if len(session.get("history", [])) > 2:
+        reply = (
+            f"I'm not sure I understood that, {name}. "
+            f"You can reply with a number from the menu or just describe what you need.\n\n"
+            f"Reply *MENU* to see all options."
+        )
+    else:
+        reply = random.choice(FALLBACKS)
+
+    add_history(session, "bot", reply)
+    return reply
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FLASK WEBHOOK ROUTES
+# FLASK ROUTES
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.route("/", methods=["GET"])
 def index():
-    """Health check endpoint — Railway/Render will ping this"""
-    return {"status": "NaijaPlate AI WhatsApp Bot is running! 🍲🇳🇬", "version": "1.0"}, 200
+    return {"status": "NaijaPlate AI is running", "version": "2.0"}, 200
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    """
-    Twilio sends POST here whenever a WhatsApp message is received.
-    Configure this URL in your Twilio Sandbox settings.
-    """
-    incoming_msg = request.values.get("Body",    "").strip()
-    sender_phone = request.values.get("From",    "")   # e.g. "whatsapp:+2348012345678"
+    incoming_msg = request.values.get("Body", "").strip()
+    sender_phone = request.values.get("From", "")
 
-    app.logger.info(f"MSG from {sender_phone}: {incoming_msg}")
+    app.logger.info(f"[{sender_phone}]: {incoming_msg}")
 
-    # Generate reply
     reply_text = handle_message(sender_phone, incoming_msg)
 
-    # Build TwiML response
     resp = MessagingResponse()
-    msg  = resp.message()
 
-    # WhatsApp messages max ~1600 chars — split if needed
-    if len(reply_text) <= 1600:
-        msg.body(reply_text)
+    # Split long messages (WhatsApp limit ~1600 chars)
+    if len(reply_text) <= 1550:
+        resp.message(reply_text)
     else:
-        # Send first chunk, append continuation note
-        chunk = reply_text[:1550]
-        last_newline = chunk.rfind("\n")
-        if last_newline > 0:
-            chunk = chunk[:last_newline]
-        msg.body(chunk + "\n\n_(Reply *MORE* for the rest)_")
-        # Store overflow in session for next message (simple approach)
-        phone = sender_phone
-        session = get_session(phone)
-        session["overflow"] = reply_text[len(chunk):]
-        save_session(phone, session)
+        chunks = []
+        remaining = reply_text
+        while len(remaining) > 1550:
+            split_at = remaining[:1550].rfind("\n")
+            if split_at < 0:
+                split_at = 1550
+            chunks.append(remaining[:split_at])
+            remaining = remaining[split_at:].strip()
+        chunks.append(remaining)
+        for chunk in chunks[:2]:  # max 2 messages
+            resp.message(chunk)
 
-    return str(resp), 200, {"Content-Type": "text/xml"}
+    return Response(str(resp), mimetype="text/xml")
 
 @app.route("/webhook", methods=["GET"])
 def webhook_verify():
-    """Some platforms send a GET to verify the webhook is alive"""
-    return "NaijaPlate AI Webhook Active ✅", 200
+    return "NaijaPlate AI Webhook Active", 200
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ENTRYPOINT
+# NOTE ON SANDBOX JOIN CODE
 # ─────────────────────────────────────────────────────────────────────────────
+# The "join <word>" requirement is a Twilio Sandbox limitation only.
+# To remove it, upgrade to the Meta WhatsApp Business API with a verified
+# business account. Users will then message your number directly with no join code.
+# See: https://www.twilio.com/docs/whatsapp/api
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    print(f"🍲 NaijaPlate AI WhatsApp Bot starting on port {port}...")
-    print(f"📡 Webhook URL: http://0.0.0.0:{port}/webhook")
+    print(f"NaijaPlate AI v2 starting on port {port}...")
     app.run(host="0.0.0.0", port=port, debug=False)
